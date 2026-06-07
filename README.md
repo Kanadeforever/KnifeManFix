@@ -1,0 +1,478 @@
+# 小李飞刀 (KnifeMan) 免CD补丁——完整分析报告
+
+## 概述
+
+- **游戏名称**: 小李飞刀 / KnifeMan
+- **发行年份**: 2002
+- **可执行文件**: `KnifeMan.exe` (1,486,848 字节, PE32, ImageBase 0x400000)
+- **引擎DLL**: `thd.dll` (摄像机/文件管理/脚本引擎), `IFC22.dll` (Immersion力反馈/输入)
+- **CD验证方式**: 光盘类型检测 + 卷标验证 + 脚本系统对话框
+- **开发工具**: Visual C++ 6.0 (MSVC运行时字符串可见, 使用`_CrtCheckMemory()`等调试函数)
+- **补丁总修改量**: 7处, 共47字节
+
+---
+
+## 一、CD验证机制分析
+
+### 1.1 整体架构
+
+游戏的CD验证分为三个层次，层层递进：
+
+```
+┌──────────────────────────────────────────────────┐
+│ 层次1: 脚本层 (Script Layer)                      │
+│ "insertcd2" 脚本命令 → C++内建函数 → 显示CD对话框  │
+│ 参数: (0, 0x78, 0xF0, "insertcd2")               │
+├──────────────────────────────────────────────────┤
+│ 层次2: 对话框层 (Dialog Layer)                    │
+│ CDialogPlayer/CDialogPlayerEx 类 → 渲染对话UI     │
+│ 处理WM_KEYDOWN(VK_RETURN) → 触发CD检查            │
+├──────────────────────────────────────────────────┤
+│ 层次3: 驱动检查层 (Drive Check Layer)             │
+│ GetLogicalDrives → GetDriveTypeA                  │
+│ → GetVolumeInformationA → 卷标比较("KnifeMan")     │
+└──────────────────────────────────────────────────┘
+```
+
+### 1.2 CD检查函数 (RVA 0x1B5D0) 完整逆向
+
+这是核心CD验证函数，位于 `KnifeMan.exe` 的 `.text` 段。它是一个`__thiscall`成员函数，接收一个对象指针(this)，检查所有驱动器找到匹配的游戏CD。
+
+**原始汇编逻辑（逐行注释）**:
+
+```asm
+; === 函数序言 ===
+0x1B5D0: SUB  ESP, 0x278        ; 分配栈空间
+0x1B5D6: PUSH EBX
+0x1B5D7: PUSH EBP
+0x1B5D8: PUSH ESI
+0x1B5D9: PUSH EDI
+0x1B5DA: MOV  EBX, ECX          ; EBX = this
+
+; === 获取驱动器列表 ===
+0x1B5DC: CALL [0x53D2D8]        ; GetLogicalDrives()
+0x1B5E2: MOV  EBP, [0x53D2DC]   ; EBP = GetDriveTypeA (函数指针)
+0x1B5E8: MOV  [ESP+0x10], EAX   ; 保存驱动器位掩码
+0x1B5EC: XOR  EDI, EDI          ; EDI = 0 (循环计数器)
+
+; === 驱动器枚举循环 ===
+0x1B5EE: MOV  EAX, 1            ; EAX = 1
+0x1B5F3: MOV  ECX, EDI
+0x1B5F5: SHL  EAX, CL           ; 位掩码: 1 << EDI
+0x1B5F7: MOV  ECX, [ESP+0x10]   ; ECX = 驱动器位掩码
+0x1B5FB: TEST ECX, EAX          ; 检查此驱动器是否存在
+0x1B5FD: JE   0x1B683           ; 不存在 → NextDrive
+
+; --- 格式化驱动器根路径 ---
+0x1B603: LEA  ESI, [EDI+0x41]   ; ESI = 'A' + EDI (驱动器字母)
+0x1B606: LEA  EDX, [ESP+0xA0]   ; EDX = 缓冲区
+0x1B60D: PUSH ESI               ; push 驱动器字母
+0x1B60E: PUSH 0x55A69C           ; push "%c:\"
+0x1B613: PUSH EDX               ; push 缓冲区
+0x1B614: CALL sprintf            ; sprintf(buf, "%c:\\", drive_letter)
+0x1B619: ADD  ESP, 0xC
+
+; --- 检查驱动器类型 (★补丁点1) ---
+0x1B61C: LEA  EAX, [ESP+0xA0]   ; EAX = "X:\"
+0x1B623: PUSH EAX
+0x1B624: CALL EBP                ; GetDriveTypeA("X:\")
+0x1B626: CMP  EAX, 5             ; DRIVE_CDROM = 5
+0x1B629: JNE  0x1B683           ; 不是CD-ROM → NextDrive
+
+; --- 获取卷标信息 (★补丁点2) ---
+0x1B62B: MOV  EAX, [EBX+4]      ; 获取之前的盘符
+0x1B62E: TEST EAX, EAX
+0x1B630: JNE  0x1B635
+0x1B632: MOV  [EBX+4], ESI      ; 存储盘符到对象
+0x1B635: ... (多个 LEA/PUSH 准备GetVolumeInformationA参数)
+0x1B65D: CALL [0x53D2E0]        ; GetVolumeInformationA(...)
+0x1B663: MOV  EAX, [ESP+0x14]
+0x1B667: TEST EAX, EAX
+0x1B669: JE   0x1B683           ; 获取失败 → NextDrive
+
+; --- 比较卷标名称 (★补丁点3) ---
+0x1B66B: LEA  ECX, [ESP+0x20]   ; 卷名缓冲区
+0x1B66F: PUSH 8                  ; 比较长度
+0x1B671: PUSH ECX
+0x1B672: PUSH 0x55A690           ; "KnifeMan" 字符串
+0x1B677: CALL strncmp/memcmp     ; 比较卷名
+0x1B67C: ADD  ESP, 0xC
+0x1B67F: TEST EAX, EAX          ; 卷标匹配?
+0x1B681: JE   0x1B698           ; 匹配 → Found
+
+; --- NextDrive ---
+0x1B683: INC  EDI               ; 下一个驱动器
+0x1B684: CMP  EDI, 0x20         ; 26个字母
+0x1B687: JL   0x1B5EE           ; 继续循环
+
+; --- 未找到CD ---
+0x1B68D: POP  EDI
+0x1B68E: POP  ESI
+0x1B68F: POP  EBP
+0x1B690: POP  EBX
+0x1B691: ADD  ESP, 0x278
+0x1B697: RET                    ; 返回，不设置[Result]
+
+; --- Found: CD找到了 (★补丁点4) ---
+0x1B698: LEA  EDX, [ESP+0x28]   ; 卷标名称
+0x1B69C: PUSH EDX
+0x1B69D: CALL 0x1BF935          ; 处理卷标, 返回3或4
+0x1B6A2: ADD  ESP, 4
+0x1B6A5: CMP  EAX, 3            ; 是否是盘1/2?
+0x1B6A8: JE   0x1B6AF           ; 是 → 设置盘符
+0x1B6AA: CMP  EAX, 4            ; 是否是盘3/4?
+0x1B6AD: JNE  0x1B6B5          ; 不是 → 跳过盘符设置
+0x1B6AF: ADD  EDI, 0x41         ; 转ASCII
+0x1B6B2: MOV  [EBX+4], EDI      ; ★存储盘符到对象★
+0x1B6B5: POP  EDI
+0x1B6B6: POP  ESI
+0x1B6B7: MOV  [EBX+0xC], EAX    ; ★存储结果到对象★
+0x1B6BA: MOV  [EBX+8], EAX      ; ★双重存储★
+0x1B6BD: POP  EBP
+0x1B6BE: POP  EBX
+0x1B6BF: ADD  ESP, 0x278
+0x1B6C5: RET
+```
+
+**伪代码等价表示**:
+
+```c
+int CDChecker::Verify() {
+    DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        if (!(drives & (1 << i))) continue;
+        
+        char root[4];
+        sprintf(root, "%c:\\", 'A' + i);
+        
+        if (GetDriveTypeA(root) != DRIVE_CDROM) continue;  // 检查1
+        this->drive = 'A' + i;  // 临时存储
+        
+        char volName[128];
+        if (!GetVolumeInformationA(root, volName, ...)) continue;  // 检查2
+        
+        if (memcmp(volName, "KnifeMan", 8) != 0) continue;  // 检查3
+        goto found;
+    }
+    return 0;  // 未找到 — [this+0xC] 不设置
+
+found:
+    int result = ProcessVolumeName(volName);  // → 返回3或4
+    if (result == 3 || result == 4) {          // 检查4
+        this->drive = 'A' + i;
+    }
+    this->result = result;  // → [this+0xC]
+    this->result2 = result; // → [this+8]
+    return result;
+}
+```
+
+### 1.3 对话框调用链（两条独立路径）
+
+**路径A: 启动对话框** — 游戏启动时无条件触发
+
+```
+调用栈（从下到上）:
+  0x1BBA0: insertcd2_handler(param=1)    ← 分配对象, 调用脚本系统
+            ↓
+  0x1BCC0: prepare_cd_dialog()           ← 格式化对话框文本
+            ↓ call at 0x17C69
+  0x17C20: startup_init()                ← 启动初始化代码
+```
+
+**路径B: 游戏内CD状态检查** — 条件触发
+
+```asm
+; 位于函数 0x1E9B0
+0x1E9EA: MOV  EAX, [ESI+0x6C]    ; 获取CD子对象
+0x1E9ED: CMP  DWORD [EAX+0xC], 3 ; CD检查结果 == 3?
+0x1E9F1: JE   0x1EC5D             ; 是 → 跳过整个对话框流程
+; ... 否则继续 ...
+0x1EA0E: PUSH 1
+0x1EA10: MOV  ECX, [ESI+0x68]
+0x1EA13: CALL 0x1BBA0             ; insertcd2_handler(param=1) → 弹对话框!
+```
+
+**关键发现**: 路径B检查的字段`[EAX+0xC]`正是CD检查函数写入的`[this+0xC]`。如果CD检查函数运行过且返回3，路径B自动跳过。但如果CD检查根本没运行（无光驱时循环提前退出，从未到达Found标签），该字段保持为0，触发对话框。
+
+---
+
+## 二、补丁方案
+
+### 2.1 设计思路
+
+```
+问题: 游戏要求验证光盘(类型+卷标) → 弹窗提示 → 用户按Enter确认
+
+策略:
+  Step A: 绕过驱动层检查 (补丁1-5)
+          → 任何驱动器都被当作有效CD
+          → CD检查永远返回成功(=3)
+  Step B: 禁用启动对话框 (补丁6)
+          → NOP掉无条件调用
+  Step C: 禁用条件对话框 (补丁7)
+          → JE改为JMP, 始终跳过弹窗
+```
+
+### 2.2 完整补丁列表
+
+#### 补丁1: 0x1B629 — 绕过驱动器类型检查
+
+| 属性 | 值 |
+|------|-----|
+| 文件偏移 | 0x1B629 |
+| 原始字节 | `75 58` |
+| 修改字节 | `90 90` |
+| 原始指令 | `JNE 0x1B683` (如果不是CD-ROM则跳过) |
+| 修改指令 | `NOP; NOP` |
+| 所属层次 | 驱动检查层 |
+
+**作用**: `GetDriveTypeA`返回后，原始代码检查返回值是否等于5(`DRIVE_CDROM`)。补丁NOP掉条件跳转，使**任意类型的驱动器**(固定磁盘C:、移动磁盘D:等)都被当作CD-ROM处理。
+
+#### 补丁2: 0x1B669 — 绕过卷信息失败检查
+
+| 属性 | 值 |
+|------|-----|
+| 文件偏移 | 0x1B669 |
+| 原始字节 | `74 18` |
+| 修改字节 | `90 90` |
+| 原始指令 | `JE 0x1B683` (GetVolumeInformationA失败则跳过) |
+| 修改指令 | `NOP; NOP` |
+| 所属层次 | 驱动检查层 |
+
+**作用**: 当`GetVolumeInformationA`因为光驱无盘等原因失败时，补丁NOP掉跳过逻辑，使代码无论如何都继续尝试卷标比较。
+
+#### 补丁3: 0x1B67F — 强制卷标名称匹配
+
+| 属性 | 值 |
+|------|-----|
+| 文件偏移 | 0x1B67F |
+| 原始字节 | `85` |
+| 修改字节 | `33` |
+| 原始指令 | `TEST EAX, EAX` (测试memcmp返回值) |
+| 修改指令 | `XOR EAX, EAX` (EAX=0, ZF=1) |
+| 所属层次 | 驱动检查层 |
+
+**作用**: 原始代码将获取的卷标与"KnifeMan"用`memcmp`比较。补丁将`TEST EAX, EAX`改为`XOR EAX, EAX`，使EAX始终为零并将零标志(ZF)设为1。后续的`JE 0x1B698`（卷标匹配则跳转到Found）因此始终触发。
+
+**技术细节**: `TEST`不改变目标寄存器但设置标志位; `XOR`清零寄存器且设置标志位。两者对后续条件跳转的影响不同: `TEST EAX, EAX` → ZF取决于EAX; `XOR EAX, EAX` → ZF一定为1。用一个字节达成了"永远通过"的效果。
+
+#### 补丁4: 0x1B6A5-0x1B6C5 — 强制成功返回值和盘符
+
+| 属性 | 值 |
+|------|-----|
+| 文件偏移 | 0x1B6A5-0x1B6C5 (32字节重组) |
+| 所属层次 | 驱动检查层 |
+| 来源 | KnifeMan_mod.exe |
+
+**原始代码**（条件判断eax==3或4才设盘符）:
+```asm
+83 F8 03       CMP EAX, 3            ; 检查结果是否是3
+74 05          JE  set_drive         ; 是 → 设盘符
+83 F8 04       CMP EAX, 4            ; 检查结果是否是4
+75 06          JNE skip_drive        ; 都不是 → 跳过
+83 C7 41       ADD EDI, 41h          ; 转为ASCII驱动器字母
+89 7B 04       MOV [EBX+4], EDI      ; 存储驱动器字母到对象
+5F             POP EDI               ; (skip_drive 从这里继续)
+5E             POP ESI
+89 43 0C       MOV [EBX+0xC], EAX    ; 存储结果
+89 43 08       MOV [EBX+8], EAX      ; 存储结果
+5D             POP EBP
+5B             POP EBX
+81 C4 78020000 ADD ESP, 0x278
+C3             RET
+```
+
+**修改后代码**（无条件成功）:
+```asm
+B8 03000000   MOV EAX, 3             ; ★强制EAX=3 (成功状态)
+83 C7 41       ADD EDI, 41h          ; ★总是转换ASCII盘符
+89 7B 04       MOV [EBX+4], EDI      ; ★总是存储盘符
+5F             POP EDI
+5E             POP ESI
+89 43 0C       MOV [EBX+0xC], EAX    ; ★总是存储result=3
+89 43 08       MOV [EBX+8], EAX      ; ★双重存储
+5D             POP EBP
+5B             POP EBX
+81 C4 78020000 ADD ESP, 0x278
+C3             RET
+83 F8 04       CMP EAX, 4            ; (死代码: 永远到达不了, 因为上面已RET)
+75 D2          JNE ...               ; (死代码)
+```
+
+**作用**: 两重效果——
+1. `MOV EAX, 3` 强制返回值为3。调用者(0x1E9B0)检查`[obj+0xC]==3`时会得到真值，跳过对话框（补丁7提供额外保障）。
+2. 无条件执行`ADD EDI, 41h; MOV [EBX+4], EDI`，确保盘符字段始终设置为第一个存在的驱动器（通常是C:）。
+
+#### 补丁5: 0x23232 — 堆栈缓冲区偏移修正
+
+| 属性 | 值 |
+|------|-----|
+| 文件偏移 | 0x23232 |
+| 原始字节 | `14` |
+| 修改字节 | `17` |
+| 原始指令 | `LEA ECX, [ESP+0x14]` |
+| 修改指令 | `LEA ECX, [ESP+0x17]` |
+| 来源 | KnifeMan_mod.exe |
+
+**作用**: 将某处局部变量的栈偏移增加3字节。原始mod中包含此修改，它在mod环境中是被验证过的正确改动。推测修改了一处字符串缓冲区偏移的对其或边界，对稳定性有影响。
+
+#### 补丁6: 0x17C69 — 禁用启动CD对话框
+
+| 属性 | 值 |
+|------|-----|
+| 文件偏移 | 0x17C69 |
+| 原始字节 | `E8 52 40 00 00` |
+| 修改字节 | `90 90 90 90 90` |
+| 原始指令 | `CALL 0x1BCC0` (启动对话框函数) |
+| 修改指令 | `NOP; NOP; NOP; NOP; NOP` |
+| 所属层次 | 脚本/对话框层 |
+
+**作用**: 移除游戏启动时无条件显示CD对话框的调用。调用链: `0x17C20` → `0x1BCC0` → `0x1BBA0(param=1)` → 脚本系统显示"请放入光盘"对话框。
+
+**栈平衡分析**: 调用前有4次PUSH (16字节参数), 调用后有`ADD ESP, 0x10`清理。只NOP调用本身, 保留栈清理, 堆栈保持平衡。
+
+#### 补丁7: 0x1E9F0 — 禁用游戏内CD状态检查对话框
+
+| 属性 | 值 |
+|------|-----|
+| 文件偏移 | 0x1E9F0 |
+| 原始字节 | `0F 84 67 02 00 00` |
+| 修改字节 | `E9 68 02 00 00 90` |
+| 原始指令 | `JE 0x1EC5D` (CD结果==3则跳过) |
+| 修改指令 | `JMP 0x1EC5D; NOP` (无条件跳过) |
+| 所属层次 | 脚本/对话框层 |
+
+**作用**: 将条件跳转改为无条件跳转。原逻辑是"如果CD检查结果==3，跳过对话框代码"。修改后无论CD检查结果是多少，都直接跳到函数尾声、跳过所有对话框代码。
+
+**跳转目标计算**:
+```
+原始 JE:  0x1E9F0 + 6 + 0x267 = 0x1EC5D  (6字节指令)
+修改 JMP: 0x1E9F0 + 5 + 0x268 = 0x1EC5D  (5字节指令 + 1字节NOP)
+```
+
+**目标地址代码**（函数成功退出路径）:
+```asm
+0x1EC5D: 5F             POP EDI      ; 恢复寄存器
+0x1EC5E: 5E             POP ESI
+0x1EC5F: 5B             POP EBX
+0x1EC60: 83 C4 44       ADD ESP, 0x44
+0x1EC63: C2 04 00       RET 4        ; 返回调用者
+```
+
+### 2.3 调试过程中的关键教训
+
+**跳转目标偏移错误导致黑屏**:
+- JE指令为6字节 (`0F 84 <4字节偏移>`)，起始于0x1E9F0
+- 初版错误地以为JE从0x1E9F1开始，导致JMP跳转目标差了1字节
+- 0x1EC5E 缺少 `POP EDI` → 栈上多了一个DWORD → `RET 4` 返回到错误地址 → 黑屏
+- 修正: 跳转到0x1EC5D (`POP EDI` 开头)，确保完整的5个pop/ret操作
+
+---
+
+## 三、完整修改文件一览
+
+### 3.1 修改汇总表
+
+| # | 文件偏移 | 原始字节 | 修改字节 | 所属函数 | 作用 |
+|---|---------|---------|---------|---------|------|
+| 1 | 0x1B629 | `75 58` | `90 90` | CDCheck::Verify | 任意驱动器→CD-ROM |
+| 2 | 0x1B669 | `74 18` | `90 90` | CDCheck::Verify | 忽略卷信息失败 |
+| 3 | 0x1B67F | `85` | `33` | CDCheck::Verify | 强制卷标匹配 |
+| 4 | 0x1B6A5 | 代码重组 | `MOV EAX,3`+重组 | CDCheck::Verify | 强制返回成功+盘符 |
+| 5 | 0x23232 | `14` | `17` | 未知helper | 堆栈偏移修正 |
+| 6 | 0x17C69 | `E8...` | `NOP×5` | startup_init | 禁用启动对话框 |
+| 7 | 0x1E9F0 | `0F 84...` | `E9 68...90` | CDStateMgr | 禁用游戏内对话框 |
+
+### 3.2 与其他版本的对比
+
+| 特性 | 原始版 | KnifeMan_mod | **本补丁版** |
+|------|--------|-------------|------------|
+| CD驱动检查绕过 | ✗ | ✗ (仅卷标) | ✓ |
+| 卷标验证绕过 | ✗ | ✓ | ✓ |
+| 返回成功值 | ✗ | ✓ | ✓ |
+| 启动对话框 | ✗ | ✗ | ✓ (NOP) |
+| 游戏内对话框 | ✗ | ✗ | ✓ (JE→JMP) |
+| 有光驱运行 | ✗ | ✓ | ✓ |
+| 无光驱运行 | ✗ | ✗ | ✓ |
+| 需要_inmm.dll | - | 是 | 否 |
+| 总修改字节 | 0 | 50 | 47 |
+
+### 3.3 KnifeMan_mod.exe问题分析
+
+原始mod只修改了CD检查函数内部（补丁3+4+5），以及部分WINMM导入表。它存在的不足：
+
+1. **未修改0x1B629** (`CMP EAX,5; JNE`): 无光驱时所有驱动器被跳过
+2. **未修改0x1B669** (`TEST EAX,EAX; JE`): 卷信息失败时跳过
+3. **未修改对话框调用**: 两个对话框触发路径都原样保留
+4. **破坏WINMM导入表**: 将`mciSendCommand`等函数名中的字符替换为`_`，使导入失败，需要`_inmm.dll`代理DLL来接管CD音频
+
+---
+
+## 四、PE结构信息
+
+### 4.1 节区表
+
+| 节区名 | VAddr | VSize | ROffset | RSize | 说明 |
+|--------|-------|-------|---------|-------|------|
+| `.text` | 0x1000 | 0x13BE1D | 0x1000 | 0x13C000 | 代码段 (所有补丁在此) |
+| `.rdata` | 0x13D000 | 0x1CF8A | 0x13D000 | 0x1D000 | 只读数据 (IAT/字符串) |
+| `.data` | 0x15A000 | 0x2DBE4 | 0x15A000 | 0xC000 | 已初始化数据 |
+| `.rsrc` | 0x188000 | 0x4CE0 | 0x166000 | 0x5000 | 资源段 |
+
+### 4.2 关键导入函数
+
+| 函数 | 来源DLL | IAT RVA | 完整VA |
+|------|---------|---------|--------|
+| `GetLogicalDrives` | KERNEL32 | 0x13D2D8 | 0x53D2D8 |
+| `GetDriveTypeA` | KERNEL32 | 0x13D2DC | 0x53D2DC |
+| `GetVolumeInformationA` | KERNEL32 | 0x13D2E0 | 0x53D2E0 |
+| `CreateFileA` | KERNEL32 | 0x13D2C4 | 0x53D2C4 |
+| `LoadLibraryA` | KERNEL32 | 0x13D170 | 0x53D170 |
+| `GetProcAddress` | KERNEL32 | 0x13D188 | 0x53D188 |
+
+### 4.3 关键数据字符串
+
+| 字符串 | RVA | 说明 |
+|--------|-----|------|
+| `"KnifeMan"` | 0x15A690 | CD卷标（验证目标） |
+| `"%c:\"` | 0x15A69C | 驱动器根路径格式 |
+| `"insertcd2"` | 0x15A6A4 | 脚本命令——触发CD对话框 |
+| `"KERNEL32"` | 0x1469B4 | DLL名称（动态加载用） |
+| `"GetDriveTypeA"` | 0x158DCE | API名称（导入名表） |
+| `"GetVolumeInformationA"` | 0x158DB6 | API名称（导入名表） |
+| `"GetLogicalDrives"` | 0x158DDE | API名称（导入名表） |
+
+---
+
+## 五、验证与测试
+
+### 5.1 测试矩阵
+
+| 测试场景 | 预期结果 | 实际结果 |
+|---------|---------|---------|
+| 有物理光驱 | 直接进入游戏，无CD对话框 | ✓ 通过 |
+| 有虚拟光驱 | 直接进入游戏，无CD对话框 | ✓ 通过 |
+| 无任何光驱 | 直接进入游戏，无CD对话框 | ✓ 通过 |
+| 游戏中触发CD检查 | 不弹窗，游戏继续 | ✓ 通过 |
+| 开场动画播放 | 正常播放 | ✓ 通过 |
+| 进入主界面 | 正常进入 | ✓ 通过 |
+
+### 5.2 回退方法
+
+```bash
+# 恢复原始版本
+cp KnifeMan.exe.bak KnifeMan.exe
+```
+
+---
+
+## 六、文件清单
+
+| 文件名 | 说明 |
+|--------|------|
+| `KnifeMan.exe.bak` | 原始未修改版(备份) |
+| `KnifeMan_nodisc.exe` | 中间版本——有光驱正常，无光驱仍弹窗 |
+| `KnifeMan_mod.exe` | 早年免CD文件——需要_inmm.dll，无光驱仍弹窗 |
+| **`KnifeMan.exe`** | **最终版——有/无光驱均正常运行，不需要额外DLL** |
+| `免CD补丁分析报告.md` | 本报告 |
