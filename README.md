@@ -20,17 +20,17 @@
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ 层次1: 脚本层 (Script Layer)                      │
-│ "insertcd2" 脚本命令 → C++内建函数 → 显示CD对话框  │
-│ 参数: (0, 0x78, 0xF0, "insertcd2")               │
+  层次1: 脚本层 (Script Layer)
+  "insertcd2" 脚本命令 → C++内建函数 → 显示CD对话框
+  参数: (0, 0x78, 0xF0, "insertcd2")
 ├──────────────────────────────────────────────────┤
-│ 层次2: 对话框层 (Dialog Layer)                    │
-│ CDialogPlayer/CDialogPlayerEx 类 → 渲染对话UI     │
-│ 处理WM_KEYDOWN(VK_RETURN) → 触发CD检查            │
+  层次2: 对话框层 (Dialog Layer)
+  CDialogPlayer/CDialogPlayerEx 类 → 渲染对话UI
+  处理WM_KEYDOWN(VK_RETURN) → 触发CD检查
 ├──────────────────────────────────────────────────┤
-│ 层次3: 驱动检查层 (Drive Check Layer)             │
-│ GetLogicalDrives → GetDriveTypeA                  │
-│ → GetVolumeInformationA → 卷标比较("KnifeMan")     │
+  层次3: 驱动检查层 (Drive Check Layer)
+  GetLogicalDrives → GetDriveTypeA
+  → GetVolumeInformationA → 卷标比较("KnifeMan")
 └──────────────────────────────────────────────────┘
 ```
 
@@ -398,14 +398,16 @@ C3             RET
 | 需要_inmm.dll | - | 是 | 否 |
 | 总修改字节 | 0 | 50 | 47 |
 
-### 3.3 KnifeMan_mod.exe问题分析
+### 3.3 旧免CD补丁“小李飞刀3CD简体中文1.03版免光盘补丁.exe”分析
 
-原始mod只修改了CD检查函数内部（补丁3+4+5），以及部分WINMM导入表。它存在的不足：
+原始补丁只修改了CD检查函数内部（补丁3+4+5），以及部分WINMM导入表。它有部分内容未能顾及到：
 
 1. **未修改0x1B629** (`CMP EAX,5; JNE`): 无光驱时所有驱动器被跳过
 2. **未修改0x1B669** (`TEST EAX,EAX; JE`): 卷信息失败时跳过
 3. **未修改对话框调用**: 两个对话框触发路径都原样保留
-4. **破坏WINMM导入表**: 将`mciSendCommand`等函数名中的字符替换为`_`，使导入失败，需要`_inmm.dll`代理DLL来接管CD音频
+4. **【待确认是否由补丁造成的】破坏WINMM导入表**: 将`mciSendCommand`等函数名中的字符替换为`_`，使导入失败，需要`_inmm.dll`代理DLL来接管CD音频
+
+PS：但非常感谢猪猪乐园的云中飞燕大佬，没有他的补丁也不会这么顺利的解决这些问题，一切的成果都是站在云中大佬的肩膀上，AI才能把它完成。
 
 ---
 
@@ -447,7 +449,7 @@ C3             RET
 
 ## 五、验证与测试
 
-### 5.1 测试矩阵
+### 测试矩阵
 
 | 测试场景 | 预期结果 | 实际结果 |
 |---------|---------|---------|
@@ -458,21 +460,13 @@ C3             RET
 | 开场动画播放 | 正常播放 | ✓ 通过 |
 | 进入主界面 | 正常进入 | ✓ 通过 |
 
-### 5.2 回退方法
-
-```bash
-# 恢复原始版本
-cp KnifeMan.exe.bak KnifeMan.exe
-```
-
 ---
 
 ## 六、文件清单
 
 | 文件名 | 说明 |
 |--------|------|
-| `KnifeMan.exe.bak` | 原始未修改版(备份) |
-| `KnifeMan_nodisc.exe` | 中间版本——有光驱正常，无光驱仍弹窗 |
-| `KnifeMan_mod.exe` | 早年免CD文件——需要_inmm.dll，无光驱仍弹窗 |
-| **`KnifeMan.exe`** | **最终版——有/无光驱均正常运行，不需要额外DLL** |
-| `免CD补丁分析报告.md` | 本报告 |
+| `KnifeMan.exe` | 最终版——有/无光驱均正常运行，不需要额外DLL |
+| **`KnifeMan_LockWindow.exe`** | **最终版PLUS——有/无光驱均正常运行，不需要额外DLL，并且鼠标锁定在游戏画面内** |
+| `免CD补丁分析报告.md` | 本README报告 |
+| **`鼠标锁定补丁实现报告.md`** | 鼠标锁定相关报告 |
